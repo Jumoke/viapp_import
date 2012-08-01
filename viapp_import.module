@@ -1,0 +1,284 @@
+<?php
+// $Id$
+
+/**
+ * @file
+ * Batch API Implemention
+ * A custom module to perform batch migration from one version of Drupal to another.
+ * By Jumoke Adekanmi | jumoke@viapp.com | http://viapp.com
+ * 
+ * Last Updated, July 31, 2012
+ * 
+ * Notes:
+ * Pending Bug: Moving files: Empty fid gets in file_managed table, can't detect problem.
+ * Temp fix: Line 127 of this code put in place to temp delete this empty fid's from file_managed table.
+ * Delete fid 309
+ */
+
+/**
+ * Implementation of hook_menu().
+ */
+function viapp_import_menu() {
+  $items = array();
+
+  $items['admin/content/viapp-import'] = array(
+    'title' => 'Viapp Import',
+    'description' => 'Run Viapp Import routines to migrate from one Drupal version to another.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('viapp_import_form'),
+    'access arguments' => array('administer site configuration'),
+  );
+
+  return $items;
+}
+
+function viapp_import_form() {
+  drupal_set_message("&nbsp; Are you sure you want to run the Viapp Import script? <br/> &nbsp; You can not revert this without re-installing the database.", 'warning');
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Start import'),
+  );
+
+  return $form;
+}
+
+function viapp_import_form_submit($form, &$form_state) {
+  $batch = array(
+    'title' => t('Importing data'),
+    'operations' => viapp_import_batch_operations(),
+    'finished' => 'viapp_import_batch_finished',
+  );
+
+  batch_set($batch);
+}
+
+function viapp_import_batch_operations() {
+  $operations = array();
+
+  $operations[] = array('viapp_import_batch_files', array());
+  $operations[] = array('viapp_import_batch_nodes', array());
+  //$operations[] = array('viapp_import_batch_comments', array());
+
+  return $operations;
+}
+
+function viapp_import_batch_finished($success, $results, $operations) {
+  if ($success) {
+    $message = t('Import finished successfully.');
+  }
+  else {
+    $message = t('Finished with an error.');
+  }
+  drupal_set_message($message);
+}
+
+
+function viapp_import_batch_files(&$context) {
+  db_set_active('legacy'); // Switch databases.
+
+  // Build the total import count.
+  if (empty($context['sandbox'])) {
+    $query = db_select('files');
+    $query->addExpression('COUNT(fid)', 'count');
+    $max = $query->execute()->fetchField();
+
+    $context['sandbox'] = array(
+      'progress' => 0,
+      'current_file' => 0,
+      'max' => $max,
+    );
+  }
+
+  $limit = 250; // Number of files to process at a time.
+  $query = db_select('files', 'f');
+  $query->innerJoin('node', 'n', 'f.nid = n.nid');
+  $query->fields('f');
+  $query->fields('n', array('created'));
+  $query->orderBy('f.fid', 'asc');
+  $query->condition('fid', $context['sandbox']['current_file'], '>');
+  $result = $query->execute();
+
+  foreach ($result as $row) {
+    
+
+    $file = (object) array(
+      'fid' => $row->fid,
+      'uid' => 1,
+      'filename' => $row->filename,
+      'uri' => 'public://' . str_replace('files/listing-photos/', 'listings/', $row->filepath),
+      'filemime' => $row->filemime,
+      'filesize' => $row->filesize,
+      'status' => 1,
+      'timestamp' => $row->created,
+    );
+
+    db_set_active('default');
+    
+     $checkdup = db_query('SELECT n.fid FROM {file_managed} n WHERE n.uri = :uri', array(':uri' => $file->uri));
+     
+      if ($checkdup->rowCount()>0) {
+        $file = file_copy($file, $destination = 'public://listings/' . $row->filename, $replace = FILE_EXISTS_RENAME);
+        $file->fid = $fid;
+      }
+      else {
+        drupal_write_record('file_managed', $file);
+      }
+    
+    //DELETE FROM `mybm`.`file_managed` WHERE `file_managed`.`fid` = 0
+
+    $context['message'] = t('Importing file @name', array('@name' => $file->filename));
+    $context['sandbox']['current_file'] = $row->fid;
+    $context['sandbox']['progress']++;
+  }
+
+  db_set_active('default'); // Switch back.
+
+  if ($context['sandbox']['progress'] != $context['sandbox']['max']) {
+    $context['finished'] = $context['sandbox']['progress'] / $context['sandbox']['max'];
+  }
+}
+
+function viapp_import_batch_nodes(&$context) {
+  db_set_active('legacy'); // Switch databases.
+
+  // Build the total import count.
+  if (empty($context['sandbox'])) {
+    $query = db_select('node');
+    $query->condition('type', array('feed', 'feed_item', 'page'), 'NOT IN');
+    $query->addExpression('COUNT(nid)', 'count');
+    $max = $query->execute()->fetchField();
+
+    $context['sandbox'] = array(
+      'progress' => 0,
+      'current_node' => 0,
+      'max' => $max,
+    );
+  }
+
+  $limit = 20; // Number of nodes to process at a time.
+  $query = db_select('node', 'n');
+  $query->join('node_revisions', 'nr', 'nr.vid = n.vid');
+  $query->orderBy('n.nid', 'asc');
+  $query->fields('n');
+  $query->fields('nr', array('body', 'teaser', 'format'));
+  $query->condition('n.nid', $context['sandbox']['current_node'], '>');
+  $query->condition('n.type', array('feed', 'feed_item', 'page'), 'NOT IN');
+  $result = $query->execute();
+
+  foreach ($result as $row) {
+    $node = (object) array(
+      'type' => $row->type,
+      'nid' => $row->nid,
+      'vid' => $row->vid,
+      'uid' => 1,
+      'status' => $row->status,
+      'language' => LANGUAGE_NONE,
+      'created' => $row->created,
+      'changed' => $row->changed,
+      'comment' => $row->comment,
+      'promote' => $row->promote,
+      'title' => $row->title,
+      'body' => array(LANGUAGE_NONE => array(array('value' => $row->body, 'summary' => $row->teaser, 'format' => 'text_editor'))),
+      'teaser' => $row->teaser,
+      'log' => '',
+    );
+
+    db_set_active('legacy'); // Switch databases.
+    /*
+    // Migrate file uploads to a file field.
+    $query = db_select('file_revisions', 'fr');
+    $query->fields('fr');
+    $query->condition('fr.vid', $row->vid);
+    $file_results = $query->execute();
+    foreach ($file_results as $file) {
+      if ($file->fid) {
+        $node->field_files[LANGUAGE_NONE][] = array('fid' => $file->fid, 'display' => $file->list, 'description' => $file->description);
+      }
+    }
+
+    // Migrate links from a link field to a text field.
+    $query = db_select('content_field_link', 'f');
+    $query->fields('f');
+    $query->condition('vid', $row->vid);
+    $link_results = $query->execute();
+    foreach ($link_results as $link) {
+      if ($link->field_link_url) {
+        $node->field_link[LANGUAGE_NONE][] = array('value' => $link->field_link_url);
+        break; // Only import the first link, this is a single-value field now.
+      }
+    }
+    */
+    
+    // Migrate images from one image field to another.
+    $query = db_select('content_field_photo_panorama', 'f');
+    $query->fields('f');
+    $query->condition('vid', $row->vid);
+    $image_results = $query->execute();
+    foreach ($image_results as $image) {
+      if ($image->field_photo_panorama_fid) {
+        $node->field_photos[LANGUAGE_NONE][] = array('fid' => $image->field_photo_panorama_fid, 'title' => '', 'alt' => $image->field_photo_panorama_alt);
+      }
+    }
+    
+    // Migrate images from one image field to another.
+    $query = db_select('content_field_photo_other', 'f');
+    $query->fields('f');
+    $query->condition('vid', $row->vid);
+    $image_results = $query->execute();
+    foreach ($image_results as $image) {
+      if ($image->field_photo_other_fid) {
+        $node->field_photos[LANGUAGE_NONE][] = array('fid' => $image->field_photo_other_fid, 'title' => '', 'alt' => $image->field_photo_other_alt);
+      }
+    }
+    
+    // Migrate listing-specific fields.
+    if ($node->type == 'listing') {
+      $query = db_select('content_type_listing', 'f');
+      $query->fields('f');
+      $query->condition('vid', $row->vid);
+      $listing_results = $query->execute();
+      foreach ($listing_results as $listing) {
+        $node->field_price[LANGUAGE_NONE][0] = array('value' => (int) $listing->field_asking_price_value); //int
+        //$node->field_area_value[LANGUAGE_NONE][] = array('value' => $listing->field_area_value);
+        $node->field_mls[LANGUAGE_NONE][] = array('value' => $listing->field_mls_num_value); //textfield
+        $node->field_visualtour[LANGUAGE_NONE][] = array('value' => $listing->field_visual_tour_link_value);
+        $node->field_floorplan[LANGUAGE_NONE][] = array('value' => $listing->field_pdf_flyer_link_value);
+        $node->field_ref_school[LANGUAGE_NONE][] = array('value' => $listing->field_school_district_value); //textfield
+        $node->field_listing_image[LANGUAGE_NONE][] = array('fid' => $listing->field_photo_main_fid, 'title' => '', 'alt' => $listing->field_photo_main_alt);
+        /*
+        field_school_district_link_url
+        field_school_district_link_title
+        field_full_mls_link_value
+        field_days_on_market_value
+        field_sold_price_value
+        field_date_of_sale_value
+        field_pdf_flyer_fid
+        field_pdf_flyer_description
+        field_pdf_flyer_list
+        */
+      }
+    }
+
+
+    // To maintain the same NID, use drupal_write_record() first, then save.
+    db_set_active('default');
+    drupal_write_record('node', $node);
+    drupal_write_record('node_revision', $node);
+    //node_save($node);
+    try {
+      node_save($node);
+    } catch (Exception $e) {
+      watchdog('viapp_import', $e->getMessage());
+    }
+
+    $context['message'] = t('Importing node @title', array('@title' => $node->title));
+    $context['sandbox']['current_node'] = $row->nid;
+    $context['sandbox']['progress']++;
+  }
+
+  db_set_active('default'); // Switch back.
+
+  if ($context['sandbox']['progress'] != $context['sandbox']['max']) {
+    $context['finished'] = $context['sandbox']['progress'] / $context['sandbox']['max'];
+  }
+}

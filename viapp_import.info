@@ -1,0 +1,5 @@
+name = Viapp Import
+description = Uses Batch API to migrate content and files from one version of Drupal to another.
+core = 7.x
+version = 7.x-1.0
+files[] = viapp_import.module
